@@ -1,7 +1,7 @@
 SHELL = /bin/bash -e
 
 DIRECTORY = "./"
-MODULES = `find aws gcp azure custom -maxdepth 2 -mindepth 2 | tr '\n' ' '`
+MODULES = `find terraform -maxdepth 3 -mindepth 3 | tr '\n' ' '`
 
 define run_command
 	$(info >>> Exec ($(1)))
@@ -17,22 +17,73 @@ help:
 	@echo "Targets:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-38s\033[0m %s\n", $$1, $$2}'
 	@echo ""
-	@echo "Parameters:"
-	@echo -e "  \033[36mDIRECTORY=[environment-root-folder]\033[0m    Select the root folder to use for terragrunt execution"
-	@echo ""
-	@echo "Examples:"
-	@echo -e "  \033[36mmake format\033[0m                            Format all code"
-	@echo -e "  \033[36mmake lint\033[0m                              Lint all code"
-	@echo -e "  \033[36mmake plan-all DIRECTORY=./aws\033[0m  Apply all modules in the \`dev/\` folder"
-	@echo -e "  \033[36mmake plan DIRECTORY=./aws/modules/debug\033[0m  Apply specific module"
-	@echo -e "  \033[36mmake apply-all DIRECTORY=./aws/modules/debug\033[0m  Apply all modules in the \`dev/australiaeast/\` folder"
-	@echo ""
 
 .PHONY: debug
 debug:
-	for module in $(MODULES); do \
-		echo $$module && make tflint-module MODULE=$$module; \
+	@for module in $(MODULES); do \
+		echo $$module && \
+		if [ "$$module" != "test" ]; then \
+        	echo "$$module does not equal test"; \
+		else \
+		    echo "$$module"; \
+    	fi \
 	done
+
+.PHONY: if-else
+if-else:
+	@if [ "test" = "test" ]; then\
+        echo "Hello world";\
+    fi
+
+# This will only push modules/patterns to their upstream repos if they have a .module-version file
+# The repositories must* exist before you can push modules/patterns to their upstream repos
+.PHONY: push-modules-and-patterns-upstream
+push-modules-and-patterns-upstream: ## Push modules and patterns that contains .module-version file upstrem
+  # Only find modules/patterns with .module-version file in the directory
+	@for module in `find -name ".module-version" | grep -v tmp | grep -v "\.terraform" | cut -d "/" -f2,3,4,5`; do \
+		echo "source-folder-path: $$module"; \
+		echo "temporary-folder-path: tmp/$$module"; \
+		echo "destination-repository-name: $$(echo $$module | cut -d / -f4)"; \
+		pwd; \
+		echo "destination-repository-tag: $$(cat $$module/.module-version)"; \
+		# Git SSH URL; \
+		# echo "Cloning $$(git config --get remote.origin.url | cut -d / -f1)/$$(echo $$module | cut -d / -f4).git into 'tmp/$$module'..."; \
+		# Git HTTPS URL; \
+		echo "Cloning $$(git config --get remote.origin.url | cut -d / -f2,3,4)/$$(echo $$module | cut -d / -f4).git into 'tmp/$$module'..."; \
+		rm -rf tmp/$$module; \
+		mkdir -p tmp/$$module; \
+		cd tmp/$$module; \
+		if ! (git clone https://oauth2:$(ACCESS_TOKEN_GITHUB)@github.com/$$(git config --get remote.origin.url | cut -d / -f4)/$$(echo $$module | cut -d / -f4).git .); then \
+        	echo "There was an Error Cloning $$(git config --get remote.origin.url | cut -d / -f1,2,3,4)/$$(echo $$module | cut -d / -f4).git into 'tmp/$$module'..."; \
+			echo "Does the repository exist? We use ACCESS_TOKEN_GITHUB in secrets to do Git operations"; \
+			exit 1; \
+		else \
+		    echo "$$module"; \
+			cd ../../../../../; \
+			echo "rsync -azv --delete $$module/ tmp/$$module/"; \
+			rsync -azv --exclude '.git' --exclude '.terraform' --delete $$module/ tmp/$$module/; \
+			cd tmp/$$module; \
+			git config --global user.email "$(GITHUB_REPOSITORY)@github.com"; \
+			git config --global user.name "$(GITHUB_ACTOR)"; \
+			git status; \
+			pwd; \
+			ls -la; \
+			# git add -A; \
+			echo "Git add -A"; \
+			git status; \
+			git commit -am "$$(git log -n 1 --pretty=format:'%s')" || true; \
+			git push; \
+			git status; \
+			git tag --list; \
+			git tag v$$(cat .module-version) || true; \
+			git push --tags || true; \
+			cd ../../../../../; \
+    	fi \
+	done
+	tree -L 4 tmp/ && \
+	echo "Removing tmp directory" && \
+	echo "Done" && \
+	rm -rf tmp; \
 
 .PHONY: format
 format: ## Format Terraform code
@@ -60,6 +111,7 @@ yamllint:
 .PHONY: tflint
 tflint:
 	$(info --- tflint)
+	@tflint --init
 	@for module in $(MODULES); do \
 		$(MAKE) --no-print-directory tflint-module MODULE=$$module; \
 	done
@@ -68,7 +120,7 @@ tflint:
 tflint-module:
 tflint-module: module-vars
 	$(info --- tflint-module ($(MODULE)))
-	@$(call run_command,tflint $(MODULE))
+	@$(call run_command,tflint --chdir $(MODULE))
 
 .PHONY: validate
 validate: ## Validate all terraform modules
@@ -77,7 +129,7 @@ validate: ## Validate all terraform modules
 		echo Running terraform validate on $$module; \
 		cd $$module; \
 		terraform validate; \
-		cd ../../../; \
+		cd ../../../../; \
 	done
 
 .PHONY: tfsec
@@ -87,8 +139,23 @@ tfsec: ## TFSec all terraform modules
 		echo Running tfsec on $$module; \
 		cd $$module; \
 		tfsec ./; \
-		cd ../../../; \
+		cd ../../../../; \
 	done
+
+.PHONY: checkov
+checkov: ## Checkov all terraform modules
+	$(info --- checkov)
+	@for module in $(MODULES); do \
+		echo Running checkov validate on $$module; \
+		cd $$module; \
+		checkov -d ./ --skip-path examples; \
+		cd ../../../../; \
+	done
+# checkov:skip:CKV2_GHA_1:Ensure top-level permissions are not set to write-all
+# checkov:skip:CKV_DOCKER_2:Ensure that HEALTHCHECK instructions have been added to container images
+# checkov:skip:CKV_DOCKER_9:Ensure that APT isn't used
+# checkov:skip:CKV_DOCKER_4:Ensure that certificate validation isn't disabled with the pip '--trusted-host' option
+	checkov -d ./ --skip-check CKV2_GHA_1 --skip-check CKV_DOCKER_9 --skip-check CKV_DOCKER_2 --skip-check CKV_DOCKER_4 --skip-check CKV2_DOCKER_4; \
 
 .PHONY: clean
 clean: ## Remove the .terragrunt-cache directories
@@ -107,15 +174,16 @@ docs: ## Generate teraform-docs for all modules
 .PHONY: docs-module
 docs-module: module-vars
 	$(info --- docs-module ($(MODULE)))
-	@$(call run_command,terraform-docs markdown document --hide requirements --escape=false --sort-by required "$(MODULE)" > "$(MODULE)/README.md")
+	@$(call run_command, mkdir -p $(MODULE)/docs; terraform-docs markdown document --hide requirements --escape=false --sort-by required "$(MODULE)" > "$(MODULE)/docs/README.md")
 
 .PHONY: init-all
 init-all: ## Run `terraform init` for specifc [DIRECTORY]
 	$(info --- init-all ($(DIRECTORY)))
 	@for module in $(MODULES); do \
+		echo Running terraform init on $$module; \
 		cd $$module; \
 		terraform init -upgrade; \
-		cd ../../../; \
+		cd ../../../../; \
 	done
 
 .PHONY: init
